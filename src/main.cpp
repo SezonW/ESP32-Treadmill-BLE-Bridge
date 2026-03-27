@@ -1,18 +1,14 @@
-// main.cpp — ESP32 Treadmill BLE Bridge BUILD 6
-// Changes from BUILD 5:
-//   [FIX] Client leak: deleteClient() before creating new client (crash after ~3 reconnects)
-//   [FIX] Dangling pointer: store NimBLEAddress instead of NimBLEAdvertisedDevice*
-//   [FIX] volatile on shared flags (doConnect, treadmillConnected, watchConnected)
-//   [FIX] Connect timeout: 5 seconds (prevents infinite hang)
-//   [FIX] Treadmill MAC extracted to constant
-//   [FIX] readU8/readU16/readS16/readU24 — always advance idx even on bounds error
-//   [FIX] platformio.ini comment was wrong ("RSC" → "FTMS proxy")
-//   [CLEANUP] BUILD number bumped, log prefix [B6]
+// main.cpp — ESP32 Treadmill BLE Bridge BUILD 9
+// Changes from BUILD 8:
+//   [FIX] onFitShowData: hex-dump short packets instead of spamming WARNING
+//         Treadmill sends 5-6 byte status packets after session end — now logged
+//         as [FITSHOW][SHORT] for analysis rather than rejected silently
+//   [CLEANUP] BUILD number bumped, log prefix [B9]
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 
-#define ESP32_BUILD 6
+#define ESP32_BUILD 9
 
 // ── Treadmill identity ──────────────────────────────────────────────────────
 // EXILE TREX SPORT TX-400WP — random static BLE address
@@ -22,6 +18,9 @@ static const char* TREADMILL_MAC = "e3:97:52:37:c6:30";
 static const char* FTMS_SERVICE_UUID        = "00001826-0000-1000-8000-00805f9b34fb";
 static const char* TREADMILL_DATA_CHAR_UUID = "00002acd-0000-1000-8000-00805f9b34fb";
 static const char* CCCD_UUID                = "00002902-0000-1000-8000-00805f9b34fb";
+// FitShow proprietary service — sends live data (incl. step count) on 0xFFF1
+static const char* FITSHOW_SERVICE_UUID     = "0000fff0-0000-1000-8000-00805f9b34fb";
+static const char* FITSHOW_NOTIFY_CHAR_UUID = "0000fff1-0000-1000-8000-00805f9b34fb";
 
 // ── Global state ─────────────────────────────────────────────────────────────
 // These flags are set in NimBLE callbacks (separate FreeRTOS task)
@@ -33,23 +32,27 @@ static volatile bool         doConnect          = false;
 static volatile bool         treadmillConnected = false;
 static volatile bool         watchConnected     = false;
 
-// ── Treadmill data (written in FTMS callback, read in sendToWatch) ───────────
-static uint16_t gRawSpeed   = 0;   // 0.01 km/h resolution
-static uint32_t gDistanceM  = 0;   // meters
-static uint16_t gElapsedSec = 0;   // seconds
+// ── Treadmill data (written in callbacks, read in sendToWatch) ───────────────
+static uint16_t gRawSpeed   = 0;   // 0.01 km/h resolution (from FTMS 0x2ACD)
+static uint32_t gDistanceM  = 0;   // meters              (from FTMS 0x2ACD)
+static uint16_t gElapsedSec = 0;   // seconds             (from FTMS 0x2ACD)
+static uint16_t gStepCount  = 0;   // total steps         (from FitShow 0xFFF1 bytes 11-12)
 
 // ── Forward declarations ─────────────────────────────────────────────────────
 void sendToWatch();
 bool connectToTreadmill();
 
 // =============================================================================
-// Watch notification — 7-byte custom packet over FTMS proxy
+// Watch notification — 9-byte packet over FTMS proxy
+//   Bytes 0-1: raw speed  (uint16 LE, 0.01 km/h)
+//   Bytes 2-4: distance   (uint24 LE, meters)
+//   Bytes 5-6: elapsed    (uint16 LE, seconds)
+//   Bytes 7-8: step count (uint16 LE, total steps)  ← added in BUILD 8
 // =============================================================================
 void sendToWatch() {
     if (!watchConnected || p2acdChar == nullptr) return;
 
-    // 7-byte packet: speed(2) + distance(3) + elapsed(2), all little-endian
-    uint8_t pkt[7];
+    uint8_t pkt[9];
     pkt[0] = (uint8_t)(gRawSpeed & 0xFF);
     pkt[1] = (uint8_t)((gRawSpeed >> 8) & 0xFF);
     pkt[2] = (uint8_t)(gDistanceM & 0xFF);
@@ -57,6 +60,8 @@ void sendToWatch() {
     pkt[4] = (uint8_t)((gDistanceM >> 16) & 0xFF);
     pkt[5] = (uint8_t)(gElapsedSec & 0xFF);
     pkt[6] = (uint8_t)((gElapsedSec >> 8) & 0xFF);
+    pkt[7] = (uint8_t)(gStepCount & 0xFF);
+    pkt[8] = (uint8_t)((gStepCount >> 8) & 0xFF);
 
     p2acdChar->setValue(pkt, sizeof(pkt));
     p2acdChar->notify();
@@ -128,14 +133,57 @@ void onTreadmillData(NimBLERemoteCharacteristic* pChar,
 {
     if (!parseTreadmillData(pData, length)) return;
 
-    Serial.printf("[B%d][FTMS] spd=%.2f dst=%u t=%u watch=%s\n",
+    Serial.printf("[B%d][FTMS] spd=%.2f dst=%u t=%u steps=%u watch=%s\n",
         ESP32_BUILD,
         gRawSpeed * 0.01f,
         gDistanceM,
         gElapsedSec,
+        gStepCount,
         watchConnected ? "OK" : "waiting");
 
     sendToWatch();
+}
+
+// =============================================================================
+// FitShow 0xFFF1 callback — fires every second with live session data.
+// Packet layout (17 bytes, confirmed by log analysis):
+//   [00]     = 0x02  header
+//   [01]     = 0x51 or 0x04  subtype
+//   [02]     = unknown constant
+//   [03]     = uint8  speed x0.1 km/h
+//   [04]     = 0x00
+//   [05-06]  = uint16 LE  elapsed time (seconds)
+//   [07-08]  = uint16 LE  distance (meters)
+//   [09-10]  = uint16 LE  unknown
+//   [11-12]  = uint16 LE  step count (total) ← the field we want
+//   [13-14]  = uint16 LE  always 0x0000
+//   [15]     = uint8  checksum
+//   [16]     = 0x03  end marker
+// =============================================================================
+void onFitShowData(NimBLERemoteCharacteristic* pChar,
+                   uint8_t* pData, size_t length, bool isNotify)
+{
+    if (length < 13) {
+        // Short packets (5-6 bytes) appear after session ends — different packet type.
+        // Log in hex for analysis; do not spam WARNING every second.
+        Serial.printf("[B%d][FITSHOW][SHORT] %d bytes:", ESP32_BUILD, (int)length);
+        for (size_t i = 0; i < length; i++) {
+            Serial.printf(" %02X", pData[i]);
+        }
+        Serial.println();
+        return;
+    }
+
+    // Extract step count from bytes 11-12 (uint16 little-endian)
+    uint16_t steps = (uint16_t)pData[11] | ((uint16_t)pData[12] << 8);
+
+    // Only update if new value is higher — steps never go backwards
+    if (steps > gStepCount) {
+        gStepCount = steps;
+        Serial.printf("[B%d][FITSHOW] steps=%u\n", ESP32_BUILD, gStepCount);
+        // Re-send packet to watch so step count updates immediately
+        sendToWatch();
+    }
 }
 
 // =============================================================================
@@ -156,7 +204,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 };
 
 // =============================================================================
-// BLE Client callbacks — ESP32 ↔ treadmill connection state
+// BLE Client callbacks — ESP32 <-> treadmill connection state
 // =============================================================================
 class TreadmillClientCallbacks : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient* client) override {
@@ -167,7 +215,9 @@ class TreadmillClientCallbacks : public NimBLEClientCallbacks {
         Serial.printf("[B%d][FTMS] Disconnected from treadmill. Restarting scan...\n", ESP32_BUILD);
         treadmillConnected = false;
 
-        // Reset data so watch shows zeros (= treadmill offline)
+        // Reset FTMS data so watch shows zeros (= treadmill offline).
+        // gStepCount is NOT reset — steps never go backwards, and we want
+        // the last known value to persist if treadmill disconnects mid-session.
         gRawSpeed = 0; gDistanceM = 0; gElapsedSec = 0;
         sendToWatch();
 
@@ -194,7 +244,7 @@ class ScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 };
 
 // =============================================================================
-// Connect to treadmill — GATT discovery + FTMS subscription
+// Connect to treadmill — GATT discovery + FTMS + FitShow subscriptions
 // =============================================================================
 bool connectToTreadmill() {
     // Clean up previous client to avoid NimBLE client pool exhaustion.
@@ -223,7 +273,7 @@ bool connectToTreadmill() {
     // Without this delay, service discovery sometimes fails silently.
     delay(1000);
 
-    // ── Discover FTMS service and Treadmill Data characteristic ──────────
+    // ── FTMS service and Treadmill Data characteristic ────────────────────
     NimBLERemoteService* pSvc = pClient->getService(FTMS_SERVICE_UUID);
     if (!pSvc) {
         Serial.printf("[B%d][FTMS] ERROR: FTMS service not found.\n", ESP32_BUILD);
@@ -254,6 +304,35 @@ bool connectToTreadmill() {
     }
 
     Serial.printf("[B%d][FTMS] Subscribed to 0x2ACD. Data flowing.\n", ESP32_BUILD);
+
+    // ── FitShow 0xFFF1 — live step count ─────────────────────────────────
+    // Fires every second during session. Bytes 11-12 = total step count.
+    NimBLERemoteService* pFitShowSvc = pClient->getService(FITSHOW_SERVICE_UUID);
+    if (pFitShowSvc) {
+        NimBLERemoteCharacteristic* pFitShowChar =
+            pFitShowSvc->getCharacteristic(FITSHOW_NOTIFY_CHAR_UUID);
+        if (pFitShowChar && pFitShowChar->canNotify()) {
+            pFitShowChar->subscribe(true, onFitShowData);
+            NimBLERemoteDescriptor* pFitShowCCCD =
+                pFitShowChar->getDescriptor(NimBLEUUID(CCCD_UUID));
+            if (pFitShowCCCD) {
+                uint8_t v[] = {0x01, 0x00};
+                pFitShowCCCD->writeValue(v, 2, true);
+                Serial.printf("[B%d][FITSHOW] Subscribed to 0xFFF1. Step count active.\n",
+                    ESP32_BUILD);
+            } else {
+                Serial.printf("[B%d][FITSHOW] WARNING: 0xFFF1 CCCD not found. Subscribed anyway.\n",
+                    ESP32_BUILD);
+            }
+        } else {
+            Serial.printf("[B%d][FITSHOW] WARNING: 0xFFF1 not found or not notifiable.\n",
+                ESP32_BUILD);
+        }
+    } else {
+        Serial.printf("[B%d][FITSHOW] WARNING: FitShow service 0xFFF0 not found.\n",
+            ESP32_BUILD);
+    }
+
     return true;
 }
 
@@ -270,9 +349,9 @@ void setupFtmsProxyServer() {
         NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ
     );
 
-    // Initial value: 7 bytes of zeros (no data yet)
-    uint8_t zero[7] = {0};
-    p2acdChar->setValue(zero, 7);
+    // Initial value: 9 bytes of zeros (no data yet)
+    uint8_t zero[9] = {0};
+    p2acdChar->setValue(zero, 9);
     pSvc->start();
 
     // Advertise FTMS UUID so CIQ scan finds us via getServiceUuids()
