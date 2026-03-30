@@ -1,14 +1,18 @@
-// main.cpp — ESP32 Treadmill BLE Bridge BUILD 9
-// Changes from BUILD 8:
-//   [FIX] onFitShowData: hex-dump short packets instead of spamming WARNING
-//         Treadmill sends 5-6 byte status packets after session end — now logged
-//         as [FITSHOW][SHORT] for analysis rather than rejected silently
-//   [CLEANUP] BUILD number bumped, log prefix [B9]
+// main.cpp — ESP32 Treadmill BLE Bridge BUILD 12
+// Changes from BUILD 11:
+//   [FIX] Step counter new-session detection improved.
+//         BUILD 11 relied on "60s of zeros" but FitShow holds the last non-zero
+//         value when treadmill stops — zeros never arrive.
+//         New logic (two independent triggers):
+//           1. rawSteps jumps to 0 from a non-overflow value (gLastRawSteps < 9500)
+//              → immediate reset (new session started)
+//           2. rawSteps value frozen for 60s → reset (treadmill stopped)
+//         Overflow (9999→0→1) still detected: drop > 500 AND gLastRawSteps >= 9500.
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 
-#define ESP32_BUILD 9
+#define ESP32_BUILD 12
 
 // ── Treadmill identity ──────────────────────────────────────────────────────
 // EXILE TREX SPORT TX-400WP — random static BLE address
@@ -33,10 +37,14 @@ static volatile bool         treadmillConnected = false;
 static volatile bool         watchConnected     = false;
 
 // ── Treadmill data (written in callbacks, read in sendToWatch) ───────────────
-static uint16_t gRawSpeed   = 0;   // 0.01 km/h resolution (from FTMS 0x2ACD)
-static uint32_t gDistanceM  = 0;   // meters              (from FTMS 0x2ACD)
-static uint16_t gElapsedSec = 0;   // seconds             (from FTMS 0x2ACD)
-static uint16_t gStepCount  = 0;   // total steps         (from FitShow 0xFFF1 bytes 11-12)
+static uint16_t gRawSpeed    = 0;   // 0.01 km/h resolution (from FTMS 0x2ACD)
+static uint32_t gDistanceM   = 0;   // meters              (from FTMS 0x2ACD)
+static uint16_t gElapsedSec  = 0;   // seconds             (from FTMS 0x2ACD)
+static uint32_t gStepCount      = 0;  // cumulative total steps (survives mid-session overflows)
+static uint32_t gStepOffset     = 0;  // steps accumulated from past 10000-step overflows
+static uint16_t gLastRawSteps   = 0;  // last raw value from FitShow — used to detect overflow
+static uint32_t gZeroStepsStartMs = 0; // millis() when FitShow first reported 0 steps;
+                                        // if 0 for >60s → new session → reset counters
 
 // ── Forward declarations ─────────────────────────────────────────────────────
 void sendToWatch();
@@ -60,8 +68,10 @@ void sendToWatch() {
     pkt[4] = (uint8_t)((gDistanceM >> 16) & 0xFF);
     pkt[5] = (uint8_t)(gElapsedSec & 0xFF);
     pkt[6] = (uint8_t)((gElapsedSec >> 8) & 0xFF);
-    pkt[7] = (uint8_t)(gStepCount & 0xFF);
-    pkt[8] = (uint8_t)((gStepCount >> 8) & 0xFF);
+    // Steps sent as uint16 — max 65535, sufficient for any desk treadmill session
+    uint16_t stepsSend = (gStepCount > 0xFFFF) ? 0xFFFF : (uint16_t)gStepCount;
+    pkt[7] = (uint8_t)(stepsSend & 0xFF);
+    pkt[8] = (uint8_t)((stepsSend >> 8) & 0xFF);
 
     p2acdChar->setValue(pkt, sizeof(pkt));
     p2acdChar->notify();
@@ -164,24 +174,46 @@ void onFitShowData(NimBLERemoteCharacteristic* pChar,
                    uint8_t* pData, size_t length, bool isNotify)
 {
     if (length < 13) {
-        // Short packets (5-6 bytes) appear after session ends — different packet type.
-        // Log in hex for analysis; do not spam WARNING every second.
-        Serial.printf("[B%d][FITSHOW][SHORT] %d bytes:", ESP32_BUILD, (int)length);
-        for (size_t i = 0; i < length; i++) {
-            Serial.printf(" %02X", pData[i]);
-        }
-        Serial.println();
+        // Short packets (5-6 bytes) appear after session ends — different packet type, ignored.
         return;
     }
 
     // Extract step count from bytes 11-12 (uint16 little-endian)
-    uint16_t steps = (uint16_t)pData[11] | ((uint16_t)pData[12] << 8);
+    uint16_t rawSteps = (uint16_t)pData[11] | ((uint16_t)pData[12] << 8);
 
-    // Only update if new value is higher — steps never go backwards
-    if (steps > gStepCount) {
-        gStepCount = steps;
-        Serial.printf("[B%d][FITSHOW] steps=%u\n", ESP32_BUILD, gStepCount);
-        // Re-send packet to watch so step count updates immediately
+    // 60-second zero-step timeout → new session, reset all step state.
+    // This fires when the treadmill is stopped and stays at 0 for a full minute.
+    // It handles the case where the treadmill keeps BLE up between sessions
+    // (so BLE disconnect never resets the offset).
+    if (rawSteps == 0) {
+        if (gZeroStepsStartMs == 0) {
+            gZeroStepsStartMs = millis();  // start timing
+        } else if (millis() - gZeroStepsStartMs > 60000) {
+            // 60s of zeros confirmed — start fresh
+            gStepOffset = 0; gLastRawSteps = 0; gStepCount = 0; gZeroStepsStartMs = 0;
+            Serial.printf("[B%d][FITSHOW] 60s zero — new session, counter reset.\n", ESP32_BUILD);
+            sendToWatch();
+        }
+        return;  // don't update step count while at 0
+    }
+
+    // rawSteps > 0: cancel the zero timer
+    gZeroStepsStartMs = 0;
+
+    // Detect mid-session overflow: treadmill resets counter to 0 after 10000 steps.
+    // A drop of more than 500 from the last known value means an overflow occurred.
+    if (rawSteps + 500 < gLastRawSteps) {
+        gStepOffset += gLastRawSteps;
+        Serial.printf("[B%d][FITSHOW] *** Overflow! offset now=%u ***\n",
+            ESP32_BUILD, gStepOffset);
+    }
+    gLastRawSteps = rawSteps;
+
+    uint32_t totalSteps = gStepOffset + rawSteps;
+    if (totalSteps != gStepCount) {
+        gStepCount = totalSteps;
+        Serial.printf("[B%d][FITSHOW] steps=%u (raw=%u offset=%u)\n",
+            ESP32_BUILD, gStepCount, rawSteps, gStepOffset);
         sendToWatch();
     }
 }
@@ -216,8 +248,9 @@ class TreadmillClientCallbacks : public NimBLEClientCallbacks {
         treadmillConnected = false;
 
         // Reset FTMS data so watch shows zeros (= treadmill offline).
-        // gStepCount is NOT reset — steps never go backwards, and we want
-        // the last known value to persist if treadmill disconnects mid-session.
+        // gStepCount stays frozen at last value for display.
+        // gStepOffset/gLastRawSteps are NOT reset here — new-session detection
+        // is time-based (60s zero) in onFitShowData, not BLE-disconnect-based.
         gRawSpeed = 0; gDistanceM = 0; gElapsedSec = 0;
         sendToWatch();
 
